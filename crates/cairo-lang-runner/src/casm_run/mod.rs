@@ -13,6 +13,7 @@ use cairo_lang_sierra::ids::FunctionId;
 use cairo_lang_utils::bigint::BigIntAsHex;
 use cairo_lang_utils::byte_array::{BYTE_ARRAY_MAGIC, BYTES_IN_WORD};
 use cairo_lang_utils::extract_matches;
+use cairo_vm::hint_processor::builtin_hint_processor::blake2s_hash::blake2s_compress;
 use cairo_vm::hint_processor::hint_processor_definition::{
     HintProcessor, HintProcessorLogic, HintReference,
 };
@@ -37,7 +38,7 @@ use dict_manager::DictManagerExecScope;
 use itertools::Itertools;
 use num_bigint::{BigInt, BigUint};
 use num_integer::{ExtendedGcd, Integer};
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use rand::Rng;
 use starknet_types_core::felt::{Felt as Felt252, NonZeroFelt};
 use {ark_secp256k1 as secp256k1, ark_secp256r1 as secp256r1};
@@ -102,6 +103,8 @@ pub struct CairoHintProcessor<'a> {
     pub syscalls_used_resources: StarknetExecutionResources,
     /// Avoid allocating memory segments so finalization of segment arena may not occur.
     pub no_temporary_segments: bool,
+    /// A set of markers created by the run.
+    pub markers: Vec<Vec<Felt252>>,
 }
 
 pub fn cell_ref_to_relocatable(cell_ref: &CellRef, vm: &VirtualMachine) -> Relocatable {
@@ -824,6 +827,9 @@ impl CairoHintProcessor<'_> {
             "GetClassHashAt" => execute_handle_helper(&mut |system_buffer, gas_counter| {
                 self.get_class_hash_at(gas_counter, system_buffer.next_felt252()?.into_owned())
             }),
+            "MetaTxV0" => execute_handle_helper(&mut |_system_buffer, _gas_counter| {
+                panic!("Meta transaction is not supported.")
+            }),
             _ => panic!("Unknown selector for system call!"),
         }
     }
@@ -1306,15 +1312,15 @@ impl CairoHintProcessor<'_> {
 
     /// Executes an external hint.
     fn execute_external_hint(
-        &self,
+        &mut self,
         vm: &mut VirtualMachine,
         core_hint: &ExternalHint,
     ) -> Result<(), HintError> {
         match core_hint {
-            ExternalHint::AddRelocationRule { src, dst } => Ok(vm.add_relocation_rule(
+            ExternalHint::AddRelocationRule { src, dst } => vm.add_relocation_rule(
                 extract_relocatable(vm, src)?,
                 extract_relocatable(vm, dst)?,
-            )?),
+            )?,
             ExternalHint::WriteRunParam { index, dst } => {
                 let index = get_val(vm, index)?.to_usize().expect("Got a bad index.");
                 let mut stack = vec![(cell_ref_to_relocatable(dst, vm), &self.user_args[index])];
@@ -1336,9 +1342,61 @@ impl CairoHintProcessor<'_> {
                         }
                     }
                 }
-                Ok(())
+            }
+            ExternalHint::AddMarker { start, end } => {
+                self.markers.push(read_felts(vm, start, end)?);
+            }
+            ExternalHint::Blake2sCompress { state, byte_count, message, output, finalize } => {
+                let state = extract_relocatable(vm, state)?;
+                let byte_count = get_val(vm, byte_count)?;
+                let message = extract_relocatable(vm, message)?;
+                let felt_to_u32 = |value: Felt252| value.to_le_digits()[0].try_into().ok();
+
+                let finalize = get_val(vm, finalize)?.is_one();
+
+                let into_u32 = |opt: Option<Cow<'_, _>>| match opt {
+                    Some(val) => {
+                        if let MaybeRelocatable::Int(value) = *val {
+                            value.to_le_digits()[0].try_into().ok()
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+
+                let state = vm
+                    .get_range(state, 8)
+                    .into_iter()
+                    .map(into_u32)
+                    .collect::<Option<Vec<u32>>>()
+                    .unwrap();
+                let state: [u32; 8] = state[0..8].try_into().unwrap();
+
+                let message = vm
+                    .get_range(message, 16)
+                    .into_iter()
+                    .map(into_u32)
+                    .collect::<Option<Vec<u32>>>()
+                    .unwrap();
+
+                let new_state = blake2s_compress(
+                    &state,
+                    &message.try_into().unwrap(),
+                    felt_to_u32(byte_count).unwrap(),
+                    0,
+                    if finalize { 0xffffffff } else { 0x00 },
+                    0,
+                );
+
+                let output = extract_relocatable(vm, output)?;
+
+                for (i, &val) in new_state.iter().enumerate() {
+                    vm.insert_value((output + i)?, MaybeRelocatable::Int(Felt252::from(val)))?;
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -1886,11 +1944,11 @@ pub fn execute_core_hint(
         CoreHint::RandomEcPoint { x, y } => {
             // Keep sampling a random field element `X` until `X^3 + X + beta` is a quadratic
             // residue.
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let (random_x, random_y) = loop {
                 // Randominzing 31 bytes to make sure is in range.
                 // TODO(orizi): Use `Felt252` random implementation when exists.
-                let x_bytes: [u8; 31] = rng.gen();
+                let x_bytes: [u8; 31] = rng.random();
                 let random_x = Felt252::from_bytes_be_slice(&x_bytes);
                 /// The Beta value of the Starkware elliptic curve.
                 pub const BETA: Felt252 = Felt252::from_hex_unchecked(
@@ -2376,6 +2434,20 @@ where
         }
     }
     Some(FormattedItem { item: format_short_string(&first_felt), is_string: false })
+}
+
+/// Formats the given felts as a panic string.
+pub fn format_for_panic<T>(mut felts: T) -> String
+where
+    T: Iterator<Item = Felt252> + Clone,
+{
+    let mut items = Vec::new();
+    while let Some(item) = format_next_item(&mut felts) {
+        items.push(item.quote_if_string());
+    }
+    let panic_values_string =
+        if let [item] = &items[..] { item.clone() } else { format!("({})", items.join(", ")) };
+    format!("Panicked with {panic_values_string}.")
 }
 
 /// Formats a `Felt252`, as a short string if possible.

@@ -11,9 +11,12 @@ use crate::test_utils::{SemanticDatabaseForTesting, setup_test_module};
 fn test_extern_function() {
     let db_val = SemanticDatabaseForTesting::default();
     let db = &db_val;
-    let test_module = setup_test_module(db, indoc::indoc! {"
+    let test_module = setup_test_module(
+        db,
+        indoc::indoc! {"
             extern fn foo<A, B>() nopanic;
-        "})
+        "},
+    )
     .unwrap();
     let module_id = test_module.module_id;
 
@@ -24,6 +27,7 @@ fn test_extern_function() {
     let signature = db.extern_function_signature(extern_function_id).unwrap();
     assert_eq!(
         format!("{:?}", signature.debug(db)),
-        "Signature { params: [], return_type: (), implicits: [], panicable: false }"
+        "Signature { params: [], return_type: (), implicits: [], panicable: false, is_const: \
+         false }"
     );
 }

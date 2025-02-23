@@ -1,3 +1,4 @@
+#![expect(clippy::literal_string_with_formatting_args)]
 #[cfg(not(feature = "std"))]
 use alloc::{
     format,
@@ -183,7 +184,7 @@ pub enum CoreHint {
     /// Computes the square root of value_low<<128+value_high, stores the 64bit limbs of the result
     /// in sqrt0 and sqrt1 as well as the 128bit limbs of the remainder in remainder_low and
     /// remainder_high. The remainder is defined as `value - sqrt**2`.
-    /// Lastly it checks weather `2*sqrt - remainder >= 2**128`.
+    /// Lastly it checks whether `2*sqrt - remainder >= 2**128`.
     #[cfg_attr(feature = "parity-scale-codec", codec(index = 8))]
     Uint256SquareRoot {
         value_low: ResOperand,
@@ -354,6 +355,19 @@ pub enum ExternalHint {
     /// Writes a run argument of number `index` to `dst` and on.
     #[cfg_attr(feature = "parity-scale-codec", codec(index = 1))]
     WriteRunParam { index: ResOperand, dst: CellRef },
+    /// Stores an array marker in the HintProcessor. Useful for debugging.
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 2))]
+    AddMarker { start: ResOperand, end: ResOperand },
+    // TODO(ilya): Remove once the blake2s opecode is supported by the VM.
+    /// Compresses a message using the Blake2s algorithm.
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 3))]
+    Blake2sCompress {
+        state: ResOperand,
+        byte_count: ResOperand,
+        message: ResOperand,
+        output: ResOperand,
+        finalize: ResOperand,
+    },
 }
 
 struct DerefOrImmediateFormatter<'a>(&'a DerefOrImmediate);
@@ -848,7 +862,26 @@ impl PythonicHint for ExternalHint {
             }
             Self::WriteRunParam { index, dst } => {
                 let index = ResOperandAsIntegerFormatter(index);
-                format!(r#"raise NotImplementedError("memory{dst}.. = params[{index}])")"#)
+                format!("WriteRunParam {{ dst: {dst}, index: {index} }}",)
+            }
+            Self::AddMarker { start, end } => {
+                let [start, end] = [start, end].map(ResOperandAsAddressFormatter);
+                format!("AddMarker {{ start: {start}, end: {end} }}")
+            }
+            Self::Blake2sCompress { state, byte_count, message, output, finalize } => {
+                let [state, byte_count, message, output] =
+                    [state, byte_count, message, output].map(ResOperandAsAddressFormatter);
+                let finalize = ResOperandAsIntegerFormatter(finalize);
+                formatdoc! {"
+                    
+                    Blake2sCompress {{
+                        state: {state},
+                        byte_count: {byte_count},
+                        message: {message},
+                        output: {output},
+                        finalize: {finalize}
+                    }}
+                "}
             }
         }
     }

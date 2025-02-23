@@ -12,7 +12,7 @@ use cairo_lang_syntax::node::ids::SyntaxStablePtrId;
 use cairo_lang_utils::ordered_hash_set::OrderedHashSet;
 use smol_str::SmolStr;
 
-/// A trait for arbitrary data that a macro generates along with a generated file.
+/// A trait for arbitrary data that a macro generates along with the generated file.
 pub trait GeneratedFileAuxData: std::fmt::Debug + Sync + Send {
     fn as_any(&self) -> &dyn Any;
     fn eq(&self, other: &dyn GeneratedFileAuxData) -> bool;
@@ -95,7 +95,7 @@ pub struct MacroPluginMetadata<'a> {
     pub edition: Edition,
 }
 
-// TOD(spapini): Move to another place.
+// TODO(spapini): Move to another place.
 /// A trait for a macro plugin: external plugin that generates additional code for items.
 pub trait MacroPlugin: std::fmt::Debug + Sync + Send {
     /// Generates code for an item. If no code should be generated returns None.

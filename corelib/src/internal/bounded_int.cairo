@@ -1,8 +1,10 @@
 use crate::integer::{downcast, upcast};
 use crate::RangeCheck;
 
-#[derive(Copy, Drop)]
 pub(crate) extern type BoundedInt<const MIN: felt252, const MAX: felt252>;
+
+impl BoundedIntCopy<const MIN: felt252, const MAX: felt252> of Copy<BoundedInt<MIN, MAX>>;
+impl BoundedIntDrop<const MIN: felt252, const MAX: felt252> of Drop<BoundedInt<MIN, MAX>>;
 
 impl NumericLiteralBoundedInt<
     const MIN: felt252, const MAX: felt252,
@@ -11,7 +13,7 @@ impl NumericLiteralBoundedInt<
 impl BoundedIntIntoFelt252<
     const MIN: felt252, const MAX: felt252,
 > of Into<BoundedInt<MIN, MAX>, felt252> {
-    fn into(self: BoundedInt<MIN, MAX>) -> felt252 {
+    const fn into(self: BoundedInt<MIN, MAX>) -> felt252 {
         upcast(self)
     }
 }
@@ -19,8 +21,8 @@ impl BoundedIntIntoFelt252<
 impl Felt252TryIntoBoundedInt<
     const MIN: felt252, const MAX: felt252,
 > of TryInto<felt252, BoundedInt<MIN, MAX>> {
-    fn try_into(self: felt252) -> Option<BoundedInt<MIN, MAX>> {
-        // Using `downcast` is allowed, since `BoundedInt` itself is not `pub`, and only has few
+    const fn try_into(self: felt252) -> Option<BoundedInt<MIN, MAX>> {
+        // Using `downcast` is allowed, since `BoundedInt` itself is not `pub`, and only has a few
         // specific `pub` instances, such as `u96`, `ConstZero` and `ConstOne`.
         downcast(self)
     }
@@ -113,6 +115,52 @@ extern fn bounded_int_constrain<T, const BOUNDARY: felt252, impl H: ConstrainHel
     value: T,
 ) -> Result<H::LowT, H::HighT> implicits(RangeCheck) nopanic;
 
+/// A helper trait for trimming a `BoundedInt` instance min value.
+pub trait TrimMinHelper<T> {
+    type Target;
+}
+/// A helper trait for trimming a `BoundedInt` instance max value.
+pub trait TrimMaxHelper<T> {
+    type Target;
+}
+mod trim_impl {
+    pub impl Min<T, const MIN: felt252, const MAX: felt252> of super::TrimMinHelper<T> {
+        type Target = super::BoundedInt<MIN, MAX>;
+    }
+    pub impl Max<T, const MIN: felt252, const MAX: felt252> of super::TrimMaxHelper<T> {
+        type Target = super::BoundedInt<MIN, MAX>;
+    }
+}
+impl U8TrimBelow = trim_impl::Min<u8, 1, 0xff>;
+impl U8TrimAbove = trim_impl::Max<u8, 0, 0xfe>;
+impl I8TrimBelow = trim_impl::Min<i8, -0x7f, 0x7f>;
+impl I8TrimAbove = trim_impl::Max<i8, -0x80, 0x7e>;
+impl U16TrimBelow = trim_impl::Min<u16, 1, 0xffff>;
+impl U16TrimAbove = trim_impl::Max<u16, 0, 0xfffe>;
+impl I16TrimBelow = trim_impl::Min<i16, -0x7fff, 0x7fff>;
+impl I16TrimAbove = trim_impl::Max<i16, -0x8000, 0x7ffe>;
+impl U32TrimBelow = trim_impl::Min<u32, 1, 0xffffffff>;
+impl U32TrimAbove = trim_impl::Max<u32, 0, 0xfffffffe>;
+impl I32TrimBelow = trim_impl::Min<i32, -0x7fffffff, 0x7fffffff>;
+impl I32TrimAbove = trim_impl::Max<i32, -0x80000000, 0x7ffffffe>;
+impl U64TrimBelow = trim_impl::Min<u64, 1, 0xffffffffffffffff>;
+impl U64TrimAbove = trim_impl::Max<u64, 0, 0xfffffffffffffffe>;
+impl I64TrimBelow = trim_impl::Min<i64, -0x7fffffffffffffff, 0x7fffffffffffffff>;
+impl I64TrimAbove = trim_impl::Max<i64, -0x8000000000000000, 0x7ffffffffffffffe>;
+impl U128TrimBelow = trim_impl::Min<u128, 1, 0xffffffffffffffffffffffffffffffff>;
+impl U128TrimAbove = trim_impl::Max<u128, 0, 0xfffffffffffffffffffffffffffffffe>;
+impl I128TrimBelow =
+    trim_impl::Min<i128, -0x7fffffffffffffffffffffffffffffff, 0x7fffffffffffffffffffffffffffffff>;
+impl I128TrimAbove =
+    trim_impl::Max<i128, -0x80000000000000000000000000000000, 0x7ffffffffffffffffffffffffffffffe>;
+
+extern fn bounded_int_trim_min<T, impl H: TrimMinHelper<T>>(
+    value: T,
+) -> core::internal::OptionRev<H::Target> nopanic;
+extern fn bounded_int_trim_max<T, impl H: TrimMaxHelper<T>>(
+    value: T,
+) -> core::internal::OptionRev<H::Target> nopanic;
+
 extern fn bounded_int_is_zero<T>(value: T) -> crate::zeroable::IsZeroResult<T> implicits() nopanic;
 
 /// Returns the negation of the given `felt252` value.
@@ -158,7 +206,7 @@ impl NegFelt2520x7ffffffffffffffffffffffffffffffe =
     neg_felt252::Impl<0x7ffffffffffffffffffffffffffffffe, -0x7ffffffffffffffffffffffffffffffe>;
 impl NegFelt252Minus0x7ffffffffffffffffffffffffffffffe =
     neg_felt252::Impl<-0x7ffffffffffffffffffffffffffffffe, 0x7ffffffffffffffffffffffffffffffe>;
-impl NegFelt2520x0x7fffffffffffffffffffffffffffffff =
+impl NegFelt2520x7fffffffffffffffffffffffffffffff =
     neg_felt252::Impl<0x7fffffffffffffffffffffffffffffff, -0x7fffffffffffffffffffffffffffffff>;
 impl NegFelt252Minus0x7fffffffffffffffffffffffffffffff =
     neg_felt252::Impl<-0x7fffffffffffffffffffffffffffffff, 0x7fffffffffffffffffffffffffffffff>;
@@ -167,24 +215,15 @@ impl NegFelt2520x80000000000000000000000000000000 =
 impl NegFelt252Minus0x80000000000000000000000000000000 =
     neg_felt252::Impl<-0x80000000000000000000000000000000, 0x80000000000000000000000000000000>;
 
-type MinusOne = BoundedInt<-1, -1>;
+pub type UnitInt<const VALUE: felt252> = BoundedInt<VALUE, VALUE>;
 
 impl MulMinus1<
     const MIN: felt252,
     const MAX: felt252,
     impl NegMin: NegFelt252<MIN>,
     impl NegMax: NegFelt252<MAX>,
-> of MulHelper<BoundedInt<MIN, MAX>, MinusOne> {
+> of MulHelper<BoundedInt<MIN, MAX>, UnitInt<-1>> {
     type Result = BoundedInt<NegMax::VALUE, NegMin::VALUE>;
-}
-
-mod minus_1 {
-    pub extern type Const<T, const VALUE: felt252>;
-    pub extern fn const_as_immediate<C>() -> super::BoundedInt::<-1, -1> nopanic;
-}
-mod nz_minus_1 {
-    pub extern type Const<T, C>;
-    pub extern fn const_as_immediate<C>() -> NonZero<super::MinusOne> nopanic;
 }
 
 /// A helper trait for negating a `BoundedInt` instance.
@@ -194,30 +233,28 @@ pub trait NegateHelper<T> {
 
     /// Negates the given value.
     fn negate(self: T) -> Self::Result;
-
-    /// Negates the given non-zero value.
-    fn negate_nz(self: NonZero<T>) -> NonZero<Self::Result>;
 }
 
-impl MulMinusOneNegateHelper<T, impl H: MulHelper<T, MinusOne>> of NegateHelper<T> {
+impl MulMinusOneNegateHelper<T, impl H: MulHelper<T, UnitInt<-1>>> of NegateHelper<T> {
     type Result = H::Result;
 
     fn negate(self: T) -> H::Result {
-        bounded_int_mul(self, minus_1::const_as_immediate::<minus_1::Const<MinusOne, -1>>())
+        bounded_int_mul::<_, UnitInt<-1>>(self, -1)
     }
+}
 
-    fn negate_nz(self: NonZero<T>) -> NonZero<H::Result> {
-        bounded_int_mul(
-            self,
-            nz_minus_1::const_as_immediate::<
-                nz_minus_1::Const<NonZero<MinusOne>, minus_1::Const<MinusOne, -1>>,
-            >(),
-        )
+impl NonZeroMulMinusOneNegateHelper<
+    T, impl H: MulHelper<T, UnitInt<-1>>,
+> of NegateHelper<NonZero<T>> {
+    type Result = NonZero<H::Result>;
+
+    fn negate(self: NonZero<T>) -> NonZero<H::Result> {
+        bounded_int_mul::<_, NonZero<UnitInt<-1>>>(self, -1)
     }
 }
 
 pub use {
-    bounded_int_add as add, bounded_int_sub as sub, bounded_int_mul as mul,
-    bounded_int_div_rem as div_rem, bounded_int_constrain as constrain,
-    bounded_int_is_zero as is_zero,
+    bounded_int_add as add, bounded_int_constrain as constrain, bounded_int_div_rem as div_rem,
+    bounded_int_is_zero as is_zero, bounded_int_mul as mul, bounded_int_sub as sub,
+    bounded_int_trim_max as trim_max, bounded_int_trim_min as trim_min,
 };

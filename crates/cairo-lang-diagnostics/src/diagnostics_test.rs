@@ -24,8 +24,8 @@ impl DiagnosticEntry for SimpleDiag {
         DiagnosticLocation {
             file_id: self.file_id,
             span: TextSpan {
-                start: TextOffset::default().add_width(TextWidth::new_for_testing(0)),
-                end: TextOffset::default().add_width(TextWidth::new_for_testing(6)),
+                start: TextOffset::START,
+                end: TextWidth::new_for_testing(6).as_offset(),
             },
         }
     }
@@ -56,11 +56,16 @@ fn test_diagnostics() {
     let diagnostic = SimpleDiag { file_id };
     diagnostics.add(diagnostic);
 
-    assert_eq!(diagnostics.build().format(&db_val), indoc! { "
+    assert_eq!(
+        diagnostics.build().format(&db_val),
+        indoc! { "
             error: Simple diagnostic.
-             --> dummy_file.sierra:1:1
-            abcd
-            ^**^
+             --> dummy_file.sierra:1:1-2:1
+              abcd
+             _^
+            | efg.
+            |_^
 
-        " });
+        " }
+    );
 }

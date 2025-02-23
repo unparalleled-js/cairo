@@ -1,27 +1,35 @@
-use cairo_lang_defs::ids::{EnumId, ModuleId, StructId};
+use cairo_lang_defs::ids::{EnumId, LanguageElementId, ModuleId, ModuleItemId, StructId};
 use cairo_lang_defs::plugin::PluginDiagnostic;
 use cairo_lang_semantic::db::SemanticGroup;
+use cairo_lang_semantic::helper::ModuleHelper;
 use cairo_lang_semantic::items::attribute::SemanticQueryAttrs;
+use cairo_lang_semantic::items::imp::ImplLookupContext;
 use cairo_lang_semantic::items::structure::Member;
 use cairo_lang_semantic::plugin::AnalyzerPlugin;
-use cairo_lang_semantic::{ConcreteTypeId, TypeLongId};
+use cairo_lang_semantic::types::get_impl_at_context;
+use cairo_lang_semantic::{
+    ConcreteTraitId, ConcreteTraitLongId, ConcreteTypeId, GenericArgumentId, TypeId, TypeLongId,
+};
 use cairo_lang_syntax::attribute::consts::STARKNET_INTERFACE_ATTR;
 use cairo_lang_syntax::node::helpers::QueryAttrs;
 use cairo_lang_syntax::node::ids::SyntaxStablePtrId;
 use cairo_lang_syntax::node::{Terminal, TypedStablePtr, TypedSyntaxNode};
-use cairo_lang_utils::LookupIntern;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
+use cairo_lang_utils::{Intern, LookupIntern};
 use smol_str::SmolStr;
 
 use crate::abi::{ABIError, AbiBuilder, BuilderConfig};
 use crate::contract::module_contract;
 use crate::plugin::consts::{
-    COMPONENT_ATTR, CONTRACT_ATTR, EMBEDDABLE_ATTR, FLAT_ATTR, STORAGE_ATTR, STORAGE_NODE_ATTR,
-    STORAGE_STRUCT_NAME, STORE_TRAIT, SUBSTORAGE_ATTR,
+    COMPONENT_ATTR, CONTRACT_ATTR, EMBEDDABLE_ATTR, STORAGE_ATTR, STORAGE_NODE_ATTR,
+    STORAGE_STRUCT_NAME, STORE_TRAIT,
 };
+use crate::plugin::storage_interfaces::{StorageMemberKind, get_member_storage_config};
 use crate::plugin::utils::has_derive;
 
 const ALLOW_NO_DEFAULT_VARIANT_ATTR: &str = "starknet::store_no_default_variant";
+const ALLOW_COLLIDING_PATHS_ATTR: &str = "starknet::colliding_storage_paths";
+const ALLOW_INVALID_STORAGE_MEMBERS_ATTR: &str = "starknet::invalid_storage_member_types";
 
 /// Plugin to add diagnostics for contracts for bad ABI generation.
 #[derive(Default, Debug)]
@@ -69,16 +77,25 @@ fn add_abi_diagnostics(
     let Some(contract) = module_contract(db, module_id) else {
         return;
     };
-    let Ok(abi_builder) = AbiBuilder::from_submodule(db, contract.submodule_id, BuilderConfig {
-        account_contract_validations: true,
-    }) else {
+    let Ok(abi_builder) = AbiBuilder::from_submodule(
+        db,
+        contract.submodule_id,
+        BuilderConfig { account_contract_validations: true },
+    ) else {
         return;
     };
     for err in abi_builder.errors() {
         if !matches!(err, ABIError::SemanticError) {
+            let location = err.location(db).unwrap_or_else(|| {
+                if let Ok(Some(attr)) = contract.module_id().find_attr(db, CONTRACT_ATTR) {
+                    attr.stable_ptr.untyped()
+                } else {
+                    contract.submodule_id.stable_ptr(db.upcast()).untyped()
+                }
+            });
+
             diagnostics.push(PluginDiagnostic::warning(
-                err.location(db)
-                    .unwrap_or_else(|| contract.submodule_id.stable_ptr(db.upcast()).untyped()),
+                location,
                 format!("Failed to generate ABI: {err}"),
             ));
         }
@@ -105,7 +122,7 @@ impl AnalyzerPlugin for StorageAnalyzer {
                         && (module_id.has_attr(db, CONTRACT_ATTR).unwrap_or_default()
                             || module_id.has_attr(db, COMPONENT_ATTR).unwrap_or_default()))
                 {
-                    add_storage_struct_diags(db, *id, &mut diagnostics);
+                    analyze_storage_struct(db, *id, &mut diagnostics);
                 }
             }
         }
@@ -123,36 +140,81 @@ impl AnalyzerPlugin for StorageAnalyzer {
     }
 
     fn declared_allows(&self) -> Vec<String> {
-        vec![ALLOW_NO_DEFAULT_VARIANT_ATTR.to_string()]
+        vec![
+            ALLOW_NO_DEFAULT_VARIANT_ATTR.to_string(),
+            ALLOW_COLLIDING_PATHS_ATTR.to_string(),
+            ALLOW_INVALID_STORAGE_MEMBERS_ATTR.to_string(),
+        ]
     }
 }
 
-/// Adds diagnostics for a storage struct.
-///
-/// Specifically finds cases where there are multiple paths to the same location in storage.
-fn add_storage_struct_diags(
+/// Analyzes a storage struct:
+/// - Ensures all members implement `ValidStorageTypeTrait`.
+/// - Checks for multiple paths to the same location in storage.
+fn analyze_storage_struct(
     db: &dyn SemanticGroup,
-    id: StructId,
+    struct_id: StructId,
     diagnostics: &mut Vec<PluginDiagnostic>,
 ) {
-    let paths_data = &mut StorageStructMembers { name_to_paths: OrderedHashMap::default() };
-    let Ok(members) = db.struct_members(id) else {
+    let Ok(members) = db.struct_members(struct_id) else {
         return;
     };
+    let allow_invalid_members =
+        struct_id.has_attr_with_arg(db, "allow", ALLOW_INVALID_STORAGE_MEMBERS_ATTR) == Ok(true);
+    let allow_collisions =
+        struct_id.has_attr_with_arg(db, "allow", ALLOW_COLLIDING_PATHS_ATTR) == Ok(true);
+
+    let lookup_context = ImplLookupContext::new(
+        struct_id.module_file_id(db.upcast()).0,
+        match db.struct_generic_params(struct_id) {
+            Ok(params) => params.into_iter().map(|p| p.id()).collect(),
+            Err(_) => return,
+        },
+    );
+    let paths_data = &mut StorageStructMembers { name_to_paths: OrderedHashMap::default() };
+
     for (member_name, member) in members.iter() {
+        let member_ast = member.id.stable_ptr(db.upcast()).lookup(db.upcast());
+        let member_type = member.ty.lookup_intern(db);
+        let concrete_trait_id = concrete_valid_storage_trait(db, db.intern_type(member_type));
+
+        let member_allows_invalid =
+            member_ast.has_attr_with_arg(db.upcast(), "allow", ALLOW_INVALID_STORAGE_MEMBERS_ATTR);
+
+        if !(allow_invalid_members || member_allows_invalid) {
+            let inference_result =
+                get_impl_at_context(db, lookup_context.clone(), concrete_trait_id, None);
+
+            if let Err(inference_error) = inference_result {
+                let type_pointer = member_ast.type_clause(db.upcast()).ty(db.upcast());
+                diagnostics.push(PluginDiagnostic::warning(
+                    &type_pointer,
+                    format!(
+                        "Missing `ValidStorageTypeTrait` for member type. Inference failed with: \
+                         `{}`. Possible solutions: implement `Store`, mark type with \
+                         `#[storage_node]`, or use valid args for `Vec` or `Map` library types. \
+                         To suppress this warning, use \
+                         `#[allow(starknet::invalid_storage_member_types)]`.",
+                        inference_error.format(db.elongate())
+                    ),
+                ));
+            }
+        }
+
+        // Check for storage path collisions.
+        if allow_collisions
+            || member_ast.has_attr_with_arg(db.upcast(), "allow", ALLOW_COLLIDING_PATHS_ATTR)
+        {
+            continue;
+        }
+
         member_analyze(
             db,
             member,
             member_name.clone(),
             paths_data,
             &mut vec![],
-            member
-                .id
-                .stable_ptr(db.upcast())
-                .lookup(db.upcast())
-                .name(db.upcast())
-                .stable_ptr()
-                .untyped(),
+            member_ast.name(db.upcast()).stable_ptr().untyped(),
             diagnostics,
         );
     }
@@ -176,7 +238,8 @@ impl StorageStructMembers {
             diagnostics.push(PluginDiagnostic::warning(
                 pointer_to_code,
                 format!(
-                    "The path `{}` collides with existing path `{}`.",
+                    "The path `{}` collides with existing path `{}`. Fix or add \
+                     `#[allow({ALLOW_COLLIDING_PATHS_ATTR})]` if intentional.",
                     path_to_member.join("."),
                     existing_path.join(".")
                 ),
@@ -206,14 +269,12 @@ fn member_analyze(
     diagnostics: &mut Vec<PluginDiagnostic>,
 ) {
     user_data_path.push(member_name.clone());
-    if !(member.id.stable_ptr(db.upcast()).lookup(db.upcast()).has_attr(db.upcast(), FLAT_ATTR)
-        || member
-            .id
-            .stable_ptr(db.upcast())
-            .lookup(db.upcast())
-            .has_attr(db.upcast(), SUBSTORAGE_ATTR))
-    {
-        paths_data.handle(member_name, user_data_path.clone(), pointer_to_code, diagnostics);
+    let member_ast = member.id.stable_ptr(db.upcast()).lookup(db.upcast());
+    // Ignoring diagnostics as these would have been reported previously.
+    let config = get_member_storage_config(db.upcast(), &member_ast, &mut vec![]);
+    if config.kind == StorageMemberKind::Basic {
+        let name = config.rename.map(Into::into).unwrap_or(member_name);
+        paths_data.handle(name, user_data_path.clone(), pointer_to_code, diagnostics);
         user_data_path.pop();
         return;
     }
@@ -239,7 +300,7 @@ fn member_analyze(
     user_data_path.pop();
 }
 
-/// Adds diagnostics for a enum deriving `starknet::Store`.
+/// Adds diagnostics for an enum deriving `starknet::Store`.
 ///
 /// Specifically finds cases missing a `#[default]` variant.
 fn add_derive_store_enum_diags(
@@ -259,4 +320,15 @@ fn add_derive_store_enum_diags(
             ),
         ));
     }
+}
+
+/// Resolves the concrete `ValidStorageTypeTrait` for a given type.
+fn concrete_valid_storage_trait(db: &dyn SemanticGroup, ty: TypeId) -> ConcreteTraitId {
+    let module_id = ModuleHelper::core(db).submodule("starknet").submodule("storage").id;
+    let name = "ValidStorageTypeTrait";
+    let Ok(Some(ModuleItemId::Trait(trait_id))) = db.module_item_by_name(module_id, name.into())
+    else {
+        panic!("`{}` not found in `{}`.", name, module_id.full_path(db.upcast()));
+    };
+    ConcreteTraitLongId { trait_id, generic_args: vec![GenericArgumentId::Type(ty)] }.intern(db)
 }

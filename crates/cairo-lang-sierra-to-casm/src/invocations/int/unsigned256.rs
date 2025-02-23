@@ -166,9 +166,12 @@ fn build_u256_divmod(
         casm_builder,
         [(
             "Fallthrough",
-            &[&[range_check], &[quotient0, quotient1], &[remainder0, remainder1], &[
-                quotient0, divisor0, q0d0_high, q0d0_low,
-            ]],
+            &[
+                &[range_check],
+                &[quotient0, quotient1],
+                &[remainder0, remainder1],
+                &[quotient0, divisor0, q0d0_high, q0d0_low],
+            ],
             None,
         )],
         CostValidationInfo {
@@ -356,7 +359,7 @@ fn build_u256_inv_mod_n(
         tempvar t_or_k0;
         tempvar t_or_k1;
 
-        // Find the inverse or an a proof there isn't one.
+        // Find the inverse or a proof there isn't one.
         hint U256InvModN {
             b0, b1, n0, n1
         } into {

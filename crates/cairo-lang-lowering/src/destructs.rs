@@ -12,7 +12,6 @@ use cairo_lang_semantic::items::functions::{GenericFunctionId, ImplGenericFuncti
 use cairo_lang_semantic::items::imp::ImplId;
 use cairo_lang_utils::{Intern, LookupIntern, extract_matches};
 use itertools::{Itertools, chain, zip_eq};
-use semantic::corelib::{destruct_trait_fn, panic_destruct_trait_fn};
 use semantic::{TypeId, TypeLongId};
 
 use crate::borrow_check::Demand;
@@ -162,7 +161,7 @@ impl DemandReporter<VariableId, PanicState> for DestructAdder<'_> {
 }
 
 /// A state saved for each position in the back analysis.
-/// Used to determine if a Panic object is guaranteed to exist or be created, an where.
+/// Used to determine if a Panic object is guaranteed to exist or be created, and where.
 #[derive(Clone, Default)]
 pub enum PanicState {
     /// The flow will end with a panic. The locations are all the possible places a Panic object
@@ -312,8 +311,9 @@ pub fn add_destructs(
     )
     .unwrap();
 
-    let plain_trait_function = destruct_trait_fn(db.upcast());
-    let panic_trait_function = panic_destruct_trait_fn(db.upcast());
+    let info = db.core_info();
+    let plain_trait_function = info.destruct_fn;
+    let panic_trait_function = info.panic_destruct_fn;
 
     // Add destructions.
     let stable_ptr = function_id
@@ -347,7 +347,7 @@ pub fn add_destructs(
     };
 
     for ((block_id, statement_idx, destruct_type, match_block_id), destructions) in
-        destructions.into_iter().sorted_by_key(as_tuple).rev().group_by(as_tuple).into_iter()
+        destructions.into_iter().sorted_by_key(as_tuple).rev().chunk_by(as_tuple).into_iter()
     {
         let mut stmts = vec![];
 

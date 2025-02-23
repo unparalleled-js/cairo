@@ -1,8 +1,8 @@
 use std::default::Default;
 use std::sync::Arc;
 
-use cairo_lang_defs::db::{DefsDatabase, DefsGroup, try_ext_as_virtual_impl};
-use cairo_lang_defs::ids::ModuleId;
+use cairo_lang_defs::db::{DefsDatabase, DefsGroup, init_defs_group, try_ext_as_virtual_impl};
+use cairo_lang_defs::ids::{MacroPluginLongId, ModuleId};
 use cairo_lang_defs::plugin::{
     MacroPlugin, MacroPluginMetadata, PluginDiagnostic, PluginGeneratedFile, PluginResult,
 };
@@ -14,7 +14,7 @@ use cairo_lang_filesystem::db::{
 use cairo_lang_filesystem::ids::{
     CodeMapping, CodeOrigin, CrateId, Directory, FileLongId, VirtualFile,
 };
-use cairo_lang_filesystem::span::{TextOffset, TextSpan, TextWidth};
+use cairo_lang_filesystem::span::TextSpan;
 use cairo_lang_parser::db::ParserDatabase;
 use cairo_lang_syntax::node::db::{SyntaxDatabase, SyntaxGroup};
 use cairo_lang_syntax::node::helpers::QueryAttrs;
@@ -23,6 +23,7 @@ use cairo_lang_test_utils::parse_test_file::TestRunnerResult;
 use cairo_lang_test_utils::verify_diagnostics_expectation;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::{Intern, Upcast};
+use itertools::chain;
 
 use crate::get_base_plugins;
 use crate::test_utils::expand_module_text;
@@ -36,7 +37,7 @@ cairo_lang_test_utils::test_file_test!(
         derive: "derive",
         generate_trait: "generate_trait",
         panicable: "panicable",
-        external_attributes_validation: "external_attributes_validation"
+        external_attributes_validation: "external_attributes_validation",
     },
     test_expand_plugin
 );
@@ -64,7 +65,13 @@ impl Default for DatabaseForTesting {
     fn default() -> Self {
         let mut res = Self { storage: Default::default() };
         init_files_group(&mut res);
-        res.set_macro_plugins(get_base_plugins());
+        init_defs_group(&mut res);
+        res.set_default_macro_plugins(
+            get_base_plugins()
+                .into_iter()
+                .map(|plugin| res.intern_macro_plugin(MacroPluginLongId(plugin)))
+                .collect(),
+        );
         res
     }
 }
@@ -112,9 +119,15 @@ pub fn test_expand_plugin_inner(
     extra_plugins: &[Arc<dyn MacroPlugin>],
 ) -> TestRunnerResult {
     let db = &mut DatabaseForTesting::default();
-    let mut plugins = db.macro_plugins();
-    plugins.extend_from_slice(extra_plugins);
-    db.set_macro_plugins(plugins);
+
+    let extra_plugins = extra_plugins
+        .iter()
+        .cloned()
+        .map(|plugin| db.intern_macro_plugin(MacroPluginLongId(plugin)));
+
+    let default_plugins = db.default_macro_plugins();
+    let plugins = chain!(default_plugins.iter().cloned(), extra_plugins).collect::<Arc<[_]>>();
+    db.set_default_macro_plugins(plugins);
 
     let cfg_set: Option<CfgSet> =
         inputs.get("cfg").map(|s| serde_json::from_str(s.as_str()).unwrap());
@@ -160,10 +173,7 @@ impl MacroPlugin for DoubleIndirectionPlugin {
         let orig_span = node.span(db);
         let code_mappings = |content: &str| {
             vec![CodeMapping {
-                span: TextSpan {
-                    start: TextOffset::default(),
-                    end: TextOffset::default().add_width(TextWidth::from_str(content)),
-                },
+                span: TextSpan::from_str(content),
                 origin: CodeOrigin::Start(orig_span.start),
             }]
         };

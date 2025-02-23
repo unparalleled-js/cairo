@@ -10,14 +10,13 @@ use cairo_lang_plugins::plugins::HasItemsInCfgEx;
 use cairo_lang_syntax::node::ast::MaybeModuleBody;
 use cairo_lang_syntax::node::db::SyntaxGroup;
 use cairo_lang_syntax::node::helpers::{BodyItems, QueryAttrs};
-use cairo_lang_syntax::node::kind::SyntaxKind;
 use cairo_lang_syntax::node::{SyntaxNode, Terminal, TypedSyntaxNode, ast};
-use cairo_lang_utils::{extract_matches, require};
+use cairo_lang_utils::extract_matches;
 
 use self::component::generate_component_specific_code;
 use self::contract::generate_contract_specific_code;
 use super::events::{EMPTY_EVENT_CODE, get_starknet_event_variants};
-use crate::plugin::aux_data::StarkNetContractAuxData;
+use crate::plugin::aux_data::StarknetContractAuxData;
 use crate::plugin::consts::{
     COMPONENT_ATTR, CONTRACT_ATTR, DEPRECATED_CONTRACT_ATTR, GENERIC_CONTRACT_STATE_NAME,
     STORAGE_ATTR, STORAGE_STRUCT_NAME,
@@ -222,7 +221,7 @@ pub(super) fn handle_module_by_storage(
             code_mappings,
             aux_data: match module_kind {
                 StarknetModuleKind::Contract => {
-                    Some(DynGeneratedFileAuxData::new(StarkNetContractAuxData {
+                    Some(DynGeneratedFileAuxData::new(StarknetContractAuxData {
                         contract_name: module_name,
                     }))
                 }
@@ -244,8 +243,7 @@ fn grand_grand_parent_starknet_module(
     // Get the containing module node. The parent is the item list, the grand parent is the module
     // body, and the grand grand parent is the module.
     let module_node = item_node.parent()?.parent()?.parent()?;
-    require(module_node.kind(db) == SyntaxKind::ItemModule)?;
-    let module_ast = ast::ItemModule::from_syntax_node(db, module_node);
+    let module_ast = ast::ItemModule::cast(db, module_node)?;
     let (module_kind, attr) = StarknetModuleKind::from_module(db, &module_ast)?;
     Some((module_ast, module_kind, attr))
 }

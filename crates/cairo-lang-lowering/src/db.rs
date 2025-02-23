@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use cairo_lang_debug::DebugWithDb;
 use cairo_lang_defs as defs;
 use cairo_lang_defs::ids::{LanguageElementId, ModuleId, ModuleItemId, NamedLanguageElementLongId};
 use cairo_lang_diagnostics::{Diagnostics, DiagnosticsBuilder, Maybe};
@@ -7,6 +8,7 @@ use cairo_lang_filesystem::ids::FileId;
 use cairo_lang_semantic::db::SemanticGroup;
 use cairo_lang_semantic::items::enm::SemanticEnumEx;
 use cairo_lang_semantic::{self as semantic, ConcreteTypeId, TypeId, TypeLongId, corelib};
+use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::ordered_hash_set::OrderedHashSet;
 use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
 use cairo_lang_utils::unordered_hash_set::UnorderedHashSet;
@@ -17,6 +19,7 @@ use num_traits::ToPrimitive;
 
 use crate::add_withdraw_gas::add_withdraw_gas;
 use crate::borrow_check::{PotentialDestructCalls, borrow_check};
+use crate::cache::load_cached_crate_functions;
 use crate::concretize::concretize_lowered;
 use crate::destructs::add_destructs;
 use crate::diagnostic::{LoweringDiagnostic, LoweringDiagnosticKind};
@@ -61,6 +64,13 @@ pub trait LoweringGroup: SemanticGroup + Upcast<dyn SemanticGroup> {
         &self,
         function_id: defs::ids::FunctionWithBodyId,
     ) -> Maybe<Arc<MultiLowering>>;
+
+    /// Returns a mapping from function ids to their multi-lowerings for the given loaded from a
+    /// cache for the given crate.
+    fn cached_multi_lowerings(
+        &self,
+        crate_id: cairo_lang_filesystem::ids::CrateId,
+    ) -> Option<Arc<OrderedHashMap<defs::ids::FunctionWithBodyId, MultiLowering>>>;
 
     /// Computes the lowered representation of a function with a body before borrow checking.
     fn priv_function_with_body_lowering(
@@ -119,8 +129,9 @@ pub trait LoweringGroup: SemanticGroup + Upcast<dyn SemanticGroup> {
         dependency_type: DependencyType,
     ) -> Maybe<Vec<ids::FunctionId>>;
 
-    /// Returns the set of direct callees of a concrete function with a body after the panic phase.
-    fn concrete_function_with_body_postpanic_direct_callees(
+    /// Returns the set of direct callees of a concrete function after the baseline optimization
+    /// phase.
+    fn concrete_function_with_body_inlined_direct_callees(
         &self,
         function_id: ids::ConcreteFunctionWithBodyId,
         dependency_type: DependencyType,
@@ -135,8 +146,8 @@ pub trait LoweringGroup: SemanticGroup + Upcast<dyn SemanticGroup> {
     ) -> Maybe<Vec<ids::ConcreteFunctionWithBodyId>>;
 
     /// Returns the set of direct callees which are functions with body of a concrete function with
-    /// a body (i.e. excluding libfunc callees), after the panic phase.
-    fn concrete_function_with_body_postpanic_direct_callees_with_body(
+    /// a body (i.e. excluding libfunc callees), after the baseline optimization phase.
+    fn concrete_function_with_body_inlined_direct_callees_with_body(
         &self,
         function_id: ids::ConcreteFunctionWithBodyId,
         dependency_type: DependencyType,
@@ -264,11 +275,11 @@ pub trait LoweringGroup: SemanticGroup + Upcast<dyn SemanticGroup> {
 
     /// Returns the representative of the concrete function's strongly connected component. The
     /// representative is consistently chosen for all the concrete functions in the same SCC.
-    /// This is using the representation after the panic phase.
+    /// This is using the representation after the baseline optimization phase.
     #[salsa::invoke(
-        crate::graph_algorithms::strongly_connected_components::concrete_function_with_body_scc_postpanic_representative
+        crate::graph_algorithms::strongly_connected_components::concrete_function_with_body_scc_inlined_representative
     )]
-    fn concrete_function_with_body_scc_postpanic_representative(
+    fn concrete_function_with_body_scc_inlined_representative(
         &self,
         function: ids::ConcreteFunctionWithBodyId,
         dependency_type: DependencyType,
@@ -276,11 +287,11 @@ pub trait LoweringGroup: SemanticGroup + Upcast<dyn SemanticGroup> {
 
     /// Returns all the concrete functions in the same strongly connected component as the given
     /// concrete function.
-    /// This is using the representation after the panic phase.
+    /// This is using the representation after the baseline optimization phase.
     #[salsa::invoke(
-        crate::graph_algorithms::strongly_connected_components::concrete_function_with_body_postpanic_scc
+        crate::graph_algorithms::strongly_connected_components::concrete_function_with_body_inlined_scc
     )]
-    fn concrete_function_with_body_postpanic_scc(
+    fn concrete_function_with_body_inlined_scc(
         &self,
         function_id: ids::ConcreteFunctionWithBodyId,
         dependency_type: DependencyType,
@@ -381,8 +392,24 @@ fn priv_function_with_body_multi_lowering(
     db: &dyn LoweringGroup,
     function_id: defs::ids::FunctionWithBodyId,
 ) -> Maybe<Arc<MultiLowering>> {
+    let crate_id = function_id.module_file_id(db.upcast()).0.owning_crate(db.upcast());
+    if let Some(map) = db.cached_multi_lowerings(crate_id) {
+        if let Some(multi_lowering) = map.get(&function_id) {
+            return Ok(Arc::new(multi_lowering.clone()));
+        } else {
+            panic!("function not found in cached lowering {:?}", function_id.debug(db));
+        }
+    };
+
     let multi_lowering = lower_semantic_function(db.upcast(), function_id)?;
     Ok(Arc::new(multi_lowering))
+}
+
+fn cached_multi_lowerings(
+    db: &dyn LoweringGroup,
+    crate_id: cairo_lang_filesystem::ids::CrateId,
+) -> Option<Arc<OrderedHashMap<defs::ids::FunctionWithBodyId, MultiLowering>>> {
+    load_cached_crate_functions(db, crate_id)
 }
 
 // * Borrow checking.
@@ -544,12 +571,12 @@ fn concrete_function_with_body_direct_callees(
     Ok(get_direct_callees(db, &lowered_function, dependency_type, &Default::default()))
 }
 
-fn concrete_function_with_body_postpanic_direct_callees(
+fn concrete_function_with_body_inlined_direct_callees(
     db: &dyn LoweringGroup,
     function_id: ids::ConcreteFunctionWithBodyId,
     dependency_type: DependencyType,
 ) -> Maybe<Vec<ids::FunctionId>> {
-    let lowered_function = db.concrete_function_with_body_postpanic_lowered(function_id)?;
+    let lowered_function = db.inlined_function_with_body_lowered(function_id)?;
     Ok(get_direct_callees(db, &lowered_function, dependency_type, &Default::default()))
 }
 
@@ -636,14 +663,14 @@ fn concrete_function_with_body_direct_callees_with_body(
     )
 }
 
-fn concrete_function_with_body_postpanic_direct_callees_with_body(
+fn concrete_function_with_body_inlined_direct_callees_with_body(
     db: &dyn LoweringGroup,
     function_id: ids::ConcreteFunctionWithBodyId,
     dependency_type: DependencyType,
 ) -> Maybe<Vec<ids::ConcreteFunctionWithBodyId>> {
     functions_with_body_from_function_ids(
         db,
-        db.concrete_function_with_body_postpanic_direct_callees(function_id, dependency_type)?,
+        db.concrete_function_with_body_inlined_direct_callees(function_id, dependency_type)?,
         dependency_type,
     )
 }
@@ -731,7 +758,16 @@ fn module_lowering_diagnostics(
             ModuleItemId::Enum(_) => {}
             ModuleItemId::TypeAlias(_) => {}
             ModuleItemId::ImplAlias(_) => {}
-            ModuleItemId::Trait(_) => {}
+            ModuleItemId::Trait(trait_id) => {
+                for trait_func in db.trait_functions(*trait_id)?.values() {
+                    if matches!(db.trait_function_body(*trait_func), Ok(Some(_))) {
+                        let function_id = defs::ids::FunctionWithBodyId::Trait(*trait_func);
+                        diagnostics.extend(
+                            db.semantic_function_with_body_lowering_diagnostics(function_id)?,
+                        );
+                    }
+                }
+            }
             ModuleItemId::Impl(impl_def_id) => {
                 for impl_func in db.impl_functions(*impl_def_id)?.values() {
                     let function_id = defs::ids::FunctionWithBodyId::Impl(*impl_func);
@@ -797,12 +833,13 @@ fn type_size(db: &dyn LoweringGroup, ty: TypeId) -> usize {
                     .to_usize()
                     .unwrap()
         }
-        TypeLongId::Closure(_) => unimplemented!(),
+        TypeLongId::Closure(closure_ty) => {
+            closure_ty.captured_types.iter().map(|ty| db.type_size(*ty)).sum()
+        }
         TypeLongId::Coupon(_) => 0,
         TypeLongId::GenericParameter(_)
         | TypeLongId::Var(_)
         | TypeLongId::ImplType(_)
-        | TypeLongId::TraitType(_)
         | TypeLongId::Missing(_) => {
             panic!("Function should only be called with fully concrete types")
         }

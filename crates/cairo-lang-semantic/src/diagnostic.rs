@@ -3,17 +3,17 @@ use std::fmt::Display;
 use cairo_lang_debug::DebugWithDb;
 use cairo_lang_defs::diagnostic_utils::StableLocation;
 use cairo_lang_defs::ids::{
-    EnumId, FunctionTitleId, ImplDefId, ImplFunctionId, ModuleId, ModuleItemId,
+    EnumId, FunctionTitleId, GenericKind, ImplDefId, ImplFunctionId, ModuleId, ModuleItemId,
     NamedLanguageElementId, StructId, TopLevelLanguageElementId, TraitFunctionId, TraitId,
     TraitImplId, UseId,
 };
 use cairo_lang_defs::plugin::PluginDiagnostic;
 use cairo_lang_diagnostics::{
-    DiagnosticAdded, DiagnosticEntry, DiagnosticLocation, DiagnosticsBuilder, ErrorCode, Severity,
-    error_code,
+    DiagnosticAdded, DiagnosticEntry, DiagnosticLocation, DiagnosticNote, DiagnosticsBuilder,
+    ErrorCode, Severity, error_code,
 };
 use cairo_lang_filesystem::db::Edition;
-use cairo_lang_syntax as syntax;
+use cairo_lang_syntax::{self as syntax};
 use itertools::Itertools;
 use smol_str::SmolStr;
 use syntax::node::ids::SyntaxStablePtrId;
@@ -22,6 +22,7 @@ use crate::corelib::LiteralError;
 use crate::db::SemanticGroup;
 use crate::expr::inference::InferenceError;
 use crate::items::feature_kind::FeatureMarkerDiagnostic;
+use crate::items::trt::ConcreteTraitTypeId;
 use crate::resolve::{ResolvedConcreteItem, ResolvedGenericItem};
 use crate::types::peel_snapshots;
 use crate::{ConcreteTraitId, semantic};
@@ -334,6 +335,47 @@ impl DiagnosticEntry for SemanticDiagnostic {
                     function_name,
                     expected_ty.format(db),
                     actual_ty.format(db)
+                )
+            }
+
+            SemanticDiagnosticKind::WrongGenericParamTraitForImplFunction {
+                impl_def_id,
+                impl_function_id,
+                trait_id,
+                expected_trait,
+                actual_trait,
+            } => {
+                let defs_db = db.upcast();
+                let function_name = impl_function_id.name(defs_db);
+                format!(
+                    "Generic parameter trait of impl function `{}::{}` is incompatible with \
+                     `{}::{}`. Expected: `{:?}`, actual: `{:?}`.",
+                    impl_def_id.name(defs_db),
+                    function_name,
+                    trait_id.name(defs_db),
+                    function_name,
+                    expected_trait.debug(db),
+                    actual_trait.debug(db)
+                )
+            }
+            SemanticDiagnosticKind::WrongGenericParamKindForImplFunction {
+                impl_def_id,
+                impl_function_id,
+                trait_id,
+                expected_kind,
+                actual_kind,
+            } => {
+                let defs_db = db.upcast();
+                let function_name = impl_function_id.name(defs_db);
+                format!(
+                    "Generic parameter kind of impl function `{}::{}` is incompatible with \
+                     `{}::{}`. Expected: `{:?}`, actual: `{:?}`.",
+                    impl_def_id.name(defs_db),
+                    function_name,
+                    trait_id.name(defs_db),
+                    function_name,
+                    expected_kind,
+                    actual_kind
                 )
             }
             SemanticDiagnosticKind::AmbiguousTrait { trait_function_id0, trait_function_id1 } => {
@@ -654,6 +696,14 @@ impl DiagnosticEntry for SemanticDiagnostic {
                      `{trait_name}`. The trait function is declared as nopanic."
                 )
             }
+            SemanticDiagnosticKind::PassConstAsNonConst { impl_function_id, trait_id } => {
+                let name = impl_function_id.name(db.upcast());
+                let trait_name = trait_id.name(db.upcast());
+                format!(
+                    "The signature of function `{name}` is incompatible with trait \
+                     `{trait_name}`. The trait function is declared as const."
+                )
+            }
             SemanticDiagnosticKind::PanicableFromNonPanicable => {
                 "Function is declared as nopanic but calls a function that may panic.".into()
             }
@@ -688,6 +738,13 @@ impl DiagnosticEntry for SemanticDiagnostic {
             SemanticDiagnosticKind::UnsupportedConstant => {
                 "This expression is not supported as constant.".into()
             }
+            SemanticDiagnosticKind::FailedConstantCalculation => {
+                "Failed to calculate constant.".into()
+            }
+            SemanticDiagnosticKind::ConstantCalculationDepthExceeded => {
+                "Constant calculation depth exceeded.".into()
+            }
+            SemanticDiagnosticKind::InnerFailedConstantCalculation(inner, _) => inner.format(db),
             SemanticDiagnosticKind::DivisionByZero => "Division by zero.".into(),
             SemanticDiagnosticKind::ExternTypeWithImplGenericsNotSupported => {
                 "Extern types with impl generics are not supported.".into()
@@ -738,20 +795,40 @@ impl DiagnosticEntry for SemanticDiagnostic {
                 "`#[inline(always)]` is not allowed for functions with impl generic parameters."
                     .into()
             }
-            SemanticDiagnosticKind::CannotCallMethod { ty, method_name, inference_errors } => {
-                if inference_errors.is_empty() {
+            SemanticDiagnosticKind::CannotCallMethod {
+                ty,
+                method_name,
+                inference_errors,
+                relevant_traits,
+            } => {
+                if !inference_errors.is_empty() {
+                    return format!(
+                        "Method `{}` could not be called on type `{}`.\n{}",
+                        method_name,
+                        ty.format(db),
+                        inference_errors.format(db)
+                    );
+                }
+                if !relevant_traits.is_empty() {
+                    let suggestions = relevant_traits
+                        .iter()
+                        .map(|trait_path| format!("`{trait_path}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    format!(
+                        "Method `{}` not found on type `{}`. Consider importing one of the \
+                         following traits: {}.",
+                        method_name,
+                        ty.format(db),
+                        suggestions
+                    )
+                } else {
                     format!(
                         "Method `{}` not found on type `{}`. Did you import the correct trait and \
                          impl?",
                         method_name,
                         ty.format(db)
-                    )
-                } else {
-                    format!(
-                        "Method `{}` could not be called on type `{}`.\n{}",
-                        method_name,
-                        ty.format(db),
-                        inference_errors.format(db)
                     )
                 }
             }
@@ -908,7 +985,10 @@ impl DiagnosticEntry for SemanticDiagnostic {
                 }
             }
             SemanticDiagnosticKind::CompilerTraitReImplementation { trait_id } => {
-                format!("Trait `{}` should not be re-implemented.", trait_id.full_path(db.upcast()))
+                format!(
+                    "Trait `{}` should not be implemented outside of the corelib.",
+                    trait_id.full_path(db.upcast())
+                )
             }
             SemanticDiagnosticKind::ClosureInGlobalScope => {
                 "Closures are not allowed in this context.".into()
@@ -920,8 +1000,37 @@ impl DiagnosticEntry for SemanticDiagnostic {
             SemanticDiagnosticKind::RefClosureArgument => {
                 "Arguments to closure functions cannot be references".into()
             }
+            SemanticDiagnosticKind::RefClosureParam => {
+                "Closure parameters cannot be references".into()
+            }
+            SemanticDiagnosticKind::MustBeNextToTypeOrTrait { trait_id } => {
+                format!(
+                    "'{}' implementation must be defined in the same module as either the type \
+                     being dereferenced or the trait itself",
+                    trait_id.name(db.upcast())
+                )
+            }
             SemanticDiagnosticKind::MutableCapturedVariable => {
                 "Capture of mutable variables in a closure is not supported".into()
+            }
+            SemanticDiagnosticKind::NonTraitTypeConstrained { identifier, concrete_trait_id } => {
+                format!(
+                    "associated type `{}` not found for `{}`",
+                    identifier,
+                    concrete_trait_id.full_path(db)
+                )
+            }
+            SemanticDiagnosticKind::DuplicateTypeConstraint {
+                concrete_trait_type_id: trait_type_id,
+            } => {
+                format!(
+                    "the value of the associated type `{}` in trait `{}` is already specified",
+                    trait_type_id.trait_type(db).name(db.upcast()),
+                    trait_type_id.concrete_trait(db).full_path(db)
+                )
+            }
+            SemanticDiagnosticKind::TypeConstraintsSyntaxNotEnabled => {
+                "Type constraints syntax is not enabled in the current crate.".into()
             }
         }
     }
@@ -952,6 +1061,14 @@ impl DiagnosticEntry for SemanticDiagnostic {
             | SemanticDiagnosticKind::UnusedUse => Severity::Warning,
             SemanticDiagnosticKind::PluginDiagnostic(diag) => diag.severity,
             _ => Severity::Error,
+        }
+    }
+
+    fn notes(&self, _db: &Self::DbType) -> &[DiagnosticNote] {
+        if let SemanticDiagnosticKind::InnerFailedConstantCalculation(_, notes) = &self.kind {
+            notes
+        } else {
+            &[]
         }
     }
 
@@ -1050,6 +1167,20 @@ pub enum SemanticDiagnosticKind {
         trait_id: TraitId,
         expected_name: SmolStr,
     },
+    WrongGenericParamTraitForImplFunction {
+        impl_def_id: ImplDefId,
+        impl_function_id: ImplFunctionId,
+        trait_id: TraitId,
+        expected_trait: ConcreteTraitId,
+        actual_trait: ConcreteTraitId,
+    },
+    WrongGenericParamKindForImplFunction {
+        impl_def_id: ImplDefId,
+        impl_function_id: ImplFunctionId,
+        trait_id: TraitId,
+        expected_kind: GenericKind,
+        actual_kind: GenericKind,
+    },
     WrongType {
         expected_ty: semantic::TypeId,
         actual_ty: semantic::TypeId,
@@ -1114,6 +1245,7 @@ pub enum SemanticDiagnosticKind {
         ty: semantic::TypeId,
         method_name: SmolStr,
         inference_errors: TraitInferenceErrors,
+        relevant_traits: Vec<String>,
     },
     NoSuchStructMember {
         struct_id: StructId,
@@ -1208,6 +1340,10 @@ pub enum SemanticDiagnosticKind {
         impl_function_id: ImplFunctionId,
         trait_id: TraitId,
     },
+    PassConstAsNonConst {
+        impl_function_id: ImplFunctionId,
+        trait_id: TraitId,
+    },
     PanicableFromNonPanicable,
     PanicableExternFunction,
     PluginDiagnostic(PluginDiagnostic),
@@ -1222,6 +1358,9 @@ pub enum SemanticDiagnosticKind {
     },
     UnsupportedOutsideOfFunction(UnsupportedOutsideOfFunctionFeatureName),
     UnsupportedConstant,
+    FailedConstantCalculation,
+    ConstantCalculationDepthExceeded,
+    InnerFailedConstantCalculation(Box<SemanticDiagnostic>, Vec<DiagnosticNote>),
     DivisionByZero,
     ExternTypeWithImplGenericsNotSupported,
     MissingSemicolon,
@@ -1296,7 +1435,19 @@ pub enum SemanticDiagnosticKind {
         shadowed_function_name: SmolStr,
     },
     RefClosureArgument,
+    RefClosureParam,
+    MustBeNextToTypeOrTrait {
+        trait_id: TraitId,
+    },
     MutableCapturedVariable,
+    NonTraitTypeConstrained {
+        identifier: SmolStr,
+        concrete_trait_id: ConcreteTraitId,
+    },
+    DuplicateTypeConstraint {
+        concrete_trait_type_id: ConcreteTraitTypeId,
+    },
+    TypeConstraintsSyntaxNotEnabled,
 }
 
 /// The kind of an expression with multiple possible return types.
@@ -1315,6 +1466,9 @@ impl SemanticDiagnosticKind {
                 error_code!(E0002)
             }
             Self::MissingMember(_) => error_code!(E0003),
+            Self::MissingItemsInImpl(_) => error_code!(E0004),
+            Self::ModuleFileNotFound(_) => error_code!(E0005),
+            Self::PathNotFound(_) => error_code!(E0006),
             _ => return None,
         })
     }
@@ -1341,7 +1495,6 @@ pub enum ElementKind {
     Variable,
     Module,
     Function,
-    TraitFunction,
     Type,
     Variant,
     Trait,
@@ -1353,10 +1506,11 @@ impl From<&ResolvedConcreteItem> for ElementKind {
             ResolvedConcreteItem::Constant(_) => ElementKind::Constant,
             ResolvedConcreteItem::Module(_) => ElementKind::Module,
             ResolvedConcreteItem::Function(_) => ElementKind::Function,
-            ResolvedConcreteItem::TraitFunction(_) => ElementKind::TraitFunction,
             ResolvedConcreteItem::Type(_) => ElementKind::Type,
             ResolvedConcreteItem::Variant(_) => ElementKind::Variant,
-            ResolvedConcreteItem::Trait(_) => ElementKind::Trait,
+            ResolvedConcreteItem::Trait(_) | ResolvedConcreteItem::SelfTrait(_) => {
+                ElementKind::Trait
+            }
             ResolvedConcreteItem::Impl(_) => ElementKind::Impl,
         }
     }
@@ -1367,7 +1521,6 @@ impl From<&ResolvedGenericItem> for ElementKind {
             ResolvedGenericItem::GenericConstant(_) => ElementKind::Constant,
             ResolvedGenericItem::Module(_) => ElementKind::Module,
             ResolvedGenericItem::GenericFunction(_) => ElementKind::Function,
-            ResolvedGenericItem::TraitFunction(_) => ElementKind::TraitFunction,
             ResolvedGenericItem::GenericType(_) | ResolvedGenericItem::GenericTypeAlias(_) => {
                 ElementKind::Type
             }
@@ -1387,7 +1540,6 @@ impl Display for ElementKind {
             ElementKind::Variable => "variable",
             ElementKind::Module => "module",
             ElementKind::Function => "function",
-            ElementKind::TraitFunction => "function",
             ElementKind::Type => "type",
             ElementKind::Variant => "variant",
             ElementKind::Trait => "trait",
@@ -1404,7 +1556,7 @@ pub struct TraitInferenceErrors {
 }
 impl TraitInferenceErrors {
     /// Is the error list empty.
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.traits_and_errors.is_empty()
     }
     /// Format the list of errors.

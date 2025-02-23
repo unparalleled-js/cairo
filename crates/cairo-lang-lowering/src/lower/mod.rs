@@ -23,11 +23,9 @@ use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use refs::ClosureInfo;
 use semantic::corelib::{
-    core_felt252_ty, core_submodule, get_core_function_id, get_core_ty_by_name, get_function_id,
-    never_ty, unit_ty,
+    core_submodule, get_core_function_id, get_core_ty_by_name, get_function_id, never_ty, unit_ty,
 };
 use semantic::items::constant::{ConstValue, value_as_const_value};
-use semantic::literals::try_extract_minus_literal;
 use semantic::types::{peel_snapshots, wrap_in_snapshots};
 use semantic::{
     ExprFunctionCallArg, ExprId, ExprPropagateError, ExprVarMemberPath, GenericArgumentId,
@@ -242,10 +240,12 @@ pub fn lower_for_loop(
         ty: unit_ty,
         location: ctx.get_location(some_block.stable_ptr.untyped()),
     });
-    let sealed_none = lowered_expr_to_block_scope_end(
+    let none_subscope_block_id = none_subscope.block_id;
+    let sealed_none = lower_early_return(
         ctx,
-        none_subscope.clone(),
-        Ok(LoweredExpr::Tuple { exprs: vec![], location: for_location }),
+        none_subscope,
+        LoweredExpr::Tuple { exprs: vec![], location: for_location },
+        for_location,
     )
     .map_err(LoweringFlowError::Failed)?;
 
@@ -260,7 +260,7 @@ pub fn lower_for_loop(
             },
             MatchArm {
                 arm_selector: MatchArmSelector::VariantId(none_variant),
-                block_id: none_subscope.block_id,
+                block_id: none_subscope_block_id,
                 var_ids: vec![none_var_id],
             },
         ],
@@ -295,7 +295,7 @@ pub fn lower_while_loop(
     let while_location = ctx.get_location(loop_expr.stable_ptr.untyped());
 
     // Main block.
-    let mut subscope_main = create_subscope_with_bound_refs(ctx, builder);
+    let mut subscope_main = create_subscope(ctx, builder);
     let block_main_id = subscope_main.block_id;
     let main_block =
         extract_matches!(&ctx.function_body.arenas.exprs[loop_expr.body], semantic::Expr::Block)
@@ -321,13 +321,14 @@ pub fn lower_while_loop(
         .map_err(LoweringFlowError::Failed)?;
 
     // Empty else block.
-    let subscope_else = create_subscope_with_bound_refs(ctx, builder);
+    let subscope_else = create_subscope(ctx, builder);
     let block_else_id = subscope_else.block_id;
     let else_block_input_var_id = ctx.new_var(VarRequest { ty: unit_ty, location: while_location });
-    let block_else = lowered_expr_to_block_scope_end(
+    let block_else = lower_early_return(
         ctx,
         subscope_else,
-        Ok(LoweredExpr::Tuple { exprs: vec![], location: while_location }),
+        LoweredExpr::Tuple { exprs: vec![], location: while_location },
+        while_location,
     )
     .map_err(LoweringFlowError::Failed)?;
 
@@ -367,7 +368,7 @@ pub fn lower_expr_while_let(
     let matched_expr = ctx.function_body.arenas.exprs[matched_expr].clone();
     let ty = matched_expr.ty();
 
-    if ty == ctx.db.core_felt252_ty()
+    if ty == ctx.db.core_info().felt252
         || corelib::get_convert_to_felt252_libfunc_name_by_type(ctx.db.upcast(), ty).is_some()
     {
         return Err(LoweringFlowError::Failed(ctx.diagnostics.report(
@@ -421,7 +422,6 @@ pub fn lower_loop_function(
     function_id: FunctionWithBodyId,
     loop_signature: Signature,
     loop_expr_id: semantic::ExprId,
-    snapped_params: &OrderedHashMap<MemberPath, semantic::ExprVarMemberPath>,
 ) -> Maybe<FlatLowered> {
     let mut ctx = LoweringContext::new(encapsulating_ctx, function_id, loop_signature.clone())?;
     let old_loop_expr_id = std::mem::replace(&mut ctx.current_loop_expr_id, Some(loop_expr_id));
@@ -430,6 +430,7 @@ pub fn lower_loop_function(
     let root_block_id = alloc_empty_block(&mut ctx);
     let mut builder = BlockBuilder::root(&mut ctx, root_block_id);
 
+    let snapped_params = ctx.usages.usages[&loop_expr_id].snap_usage.clone();
     let parameters = ctx
         .signature
         .params
@@ -580,9 +581,10 @@ fn lower_expr_block(
                 let end_stmt =
                     &ctx.function_body.arenas.statements[*expr_block.statements.last().unwrap()];
                 // Emit diagnostic for the rest of the statements with unreachable.
-                ctx.diagnostics.report(start_stmt.stable_ptr().untyped(), Unreachable {
-                    last_statement_ptr: end_stmt.into(),
-                });
+                ctx.diagnostics.report(
+                    start_stmt.stable_ptr().untyped(),
+                    Unreachable { last_statement_ptr: end_stmt.into() },
+                );
             }
         }
         return Err(err);
@@ -621,6 +623,20 @@ pub fn lowered_expr_to_block_scope_end(
         },
         Err(err) => lowering_flow_error_to_sealed_block(ctx, builder, err)?,
     })
+}
+
+/// Converts [`LoweringResult<LoweredExpr>`] into `BlockScopeEnd`.
+pub fn lower_early_return(
+    ctx: &mut LoweringContext<'_, '_>,
+    mut builder: BlockBuilder,
+    ret_expr: LoweredExpr,
+    location: LocationId,
+) -> Maybe<SealedBlockBuilder> {
+    let lowered_expr = (|| {
+        let ret_var_usage = ret_expr.as_var_usage(ctx, &mut builder)?;
+        Err(LoweringFlowError::Return(ret_var_usage, location))
+    })();
+    lowered_expr_to_block_scope_end(ctx, builder, lowered_expr)
 }
 
 /// Lowers a semantic statement.
@@ -765,7 +781,10 @@ fn lower_single_pattern(
         }) => {
             lower_tuple_like_pattern_helper(ctx, builder, lowered_expr, &patterns, ty)?;
         }
-        semantic::Pattern::Otherwise(_) => {}
+        semantic::Pattern::Otherwise(pattern) => {
+            let var = lowered_expr.as_var_usage(ctx, builder)?.var_id;
+            ctx.variables.variables[var].location = ctx.get_location(pattern.stable_ptr.untyped());
+        }
         semantic::Pattern::Missing(_) => unreachable!("Missing pattern in semantic model."),
     }
     Ok(())
@@ -1038,8 +1057,8 @@ fn add_pending_word(
 ) -> (VarUsage, VarUsage) {
     let expr_stable_ptr = expr.stable_ptr.untyped();
 
-    let u32_ty = get_core_ty_by_name(ctx.db.upcast(), "u32".into(), vec![]);
-    let felt252_ty = core_felt252_ty(ctx.db.upcast());
+    let u32_ty = ctx.db.core_info().u32;
+    let felt252_ty = ctx.db.core_info().felt252;
 
     let pending_word_usage = generators::Const {
         value: ConstValue::Int(BigInt::from_bytes_be(Sign::Plus, pending_word_bytes), felt252_ty),
@@ -1194,11 +1213,6 @@ fn lower_expr_function_call(
     builder: &mut BlockBuilder,
 ) -> LoweringResult<LoweredExpr> {
     log::trace!("Lowering a function call expression: {:?}", expr.debug(&ctx.expr_formatter));
-    if let Some(value) =
-        try_extract_minus_literal(ctx.db.upcast(), &ctx.function_body.arenas.exprs, expr)
-    {
-        return lower_expr_literal_helper(ctx, expr.stable_ptr.untyped(), expr.ty, &value, builder);
-    }
     let location = ctx.get_location(expr.stable_ptr.untyped());
 
     // TODO(spapini): Use the correct stable pointer.
@@ -1430,46 +1444,43 @@ fn lower_expr_loop(
     // Get the function id.
     let function = FunctionWithBodyLongId::Generated {
         parent: ctx.semantic_function_id,
-        key: GeneratedFunctionKey::Loop(loop_expr_id),
+        key: GeneratedFunctionKey::Loop(stable_ptr),
     }
     .intern(ctx.db);
 
-    let snap_usage = ctx.usages.usages[&loop_expr_id].snap_usage.clone();
-
     // Generate the function.
     let encapsulating_ctx = std::mem::take(&mut ctx.encapsulating_ctx).unwrap();
-    let lowered = lower_loop_function(
-        encapsulating_ctx,
-        function,
-        loop_signature.clone(),
-        loop_expr_id,
-        &snap_usage,
-    )
-    .map_err(LoweringFlowError::Failed)?;
+    let lowered =
+        lower_loop_function(encapsulating_ctx, function, loop_signature.clone(), loop_expr_id)
+            .map_err(LoweringFlowError::Failed)?;
     // TODO(spapini): Recursive call.
-    encapsulating_ctx.lowerings.insert(GeneratedFunctionKey::Loop(loop_expr_id), lowered);
+    encapsulating_ctx.lowerings.insert(GeneratedFunctionKey::Loop(stable_ptr), lowered);
     ctx.encapsulating_ctx = Some(encapsulating_ctx);
     let old_loop_expr_id = std::mem::replace(&mut ctx.current_loop_expr_id, Some(loop_expr_id));
-    for snapshot_param in snap_usage.values() {
-        // if we have access to the real member we generate a snapshot, otherwise it should be
-        // accessible with `builder.get_snap_ref`
-        if let Some(input) = builder.get_ref(ctx, snapshot_param) {
-            let (original, snapped) = generators::Snapshot {
-                input,
-                location: ctx.get_location(snapshot_param.stable_ptr().untyped()),
-            }
-            .add(ctx, &mut builder.statements);
-            builder.update_snap_ref(snapshot_param, snapped);
-            builder.update_ref(ctx, snapshot_param, original);
-        }
-    }
-    let call = call_loop_func(ctx, loop_signature, builder, loop_expr_id, stable_ptr.untyped());
+    let call = call_loop_func_ex(
+        ctx,
+        loop_signature,
+        builder,
+        loop_expr_id,
+        stable_ptr.untyped(),
+        |ctx, builder, param| {
+            if let Some(var) = builder.get_snap_ref(ctx, param) {
+                return Some(var);
+            };
+            let input = builder.get_ref(ctx, param)?;
+            let location = ctx.get_location(param.stable_ptr().untyped());
+            let (original, snapped) =
+                generators::Snapshot { input, location }.add(ctx, &mut builder.statements);
+            builder.update_ref(ctx, param, original);
+            Some(VarUsage { var_id: snapped, location })
+        },
+    );
 
     ctx.current_loop_expr_id = old_loop_expr_id;
     call
 }
 
-/// Adds a call to an inner loop-generated function.
+/// Adds a call to an inner loop-generated function from the loop function itself.
 fn call_loop_func(
     ctx: &mut LoweringContext<'_, '_>,
     loop_signature: Signature,
@@ -1477,12 +1488,35 @@ fn call_loop_func(
     loop_expr_id: ExprId,
     stable_ptr: SyntaxStablePtrId,
 ) -> LoweringResult<LoweredExpr> {
-    let location = ctx.get_location(stable_ptr);
+    call_loop_func_ex(
+        ctx,
+        loop_signature,
+        builder,
+        loop_expr_id,
+        stable_ptr,
+        |ctx, builder, param| builder.get_snap_ref(ctx, param),
+    )
+}
 
+/// Adds a call to an inner loop-generated function.
+fn call_loop_func_ex(
+    ctx: &mut LoweringContext<'_, '_>,
+    loop_signature: Signature,
+    builder: &mut BlockBuilder,
+    loop_expr_id: ExprId,
+    stable_ptr: SyntaxStablePtrId,
+    handle_snap: impl Fn(
+        &mut LoweringContext<'_, '_>,
+        &mut BlockBuilder,
+        &ExprVarMemberPath,
+    ) -> Option<VarUsage>,
+) -> LoweringResult<LoweredExpr> {
+    let location = ctx.get_location(stable_ptr);
+    let loop_stable_ptr = ctx.function_body.arenas.exprs[loop_expr_id].stable_ptr();
     // Call it.
     let function = FunctionLongId::Generated(GeneratedFunction {
         parent: ctx.concrete_function_id.base_semantic_function(ctx.db),
-        key: GeneratedFunctionKey::Loop(loop_expr_id),
+        key: GeneratedFunctionKey::Loop(loop_stable_ptr),
     })
     .intern(ctx.db);
     let inputs = loop_signature
@@ -1493,13 +1527,15 @@ fn call_loop_func(
                 .get_ref(ctx, &param)
                 .and_then(|var| (ctx.variables[var.var_id].ty == param.ty()).then_some(var))
                 .or_else(|| {
-                    let var = builder.get_snap_ref(ctx, &param)?;
+                    let var = handle_snap(ctx, builder, &param)?;
                     (ctx.variables[var.var_id].ty == param.ty()).then_some(var)
                 })
                 .ok_or_else(|| {
                     // TODO(TomerStaskware): make sure this is unreachable and remove
                     // `MemberPathLoop` diagnostic.
-                    LoweringFlowError::Failed(ctx.diagnostics.report(stable_ptr, MemberPathLoop))
+                    LoweringFlowError::Failed(
+                        ctx.diagnostics.report(param.stable_ptr(), MemberPathLoop),
+                    )
                 })
         })
         .collect::<LoweringResult<Vec<_>>>()?;
@@ -1717,7 +1753,7 @@ fn add_capture_destruct_impl(
     let signature =
         Signature::from_semantic(ctx.db, semantic_db.concrete_function_signature(function)?);
 
-    let func_key = GeneratedFunctionKey::TraitFunc(function, location);
+    let func_key = GeneratedFunctionKey::TraitFunc(trait_function, location);
     let function_id =
         FunctionWithBodyLongId::Generated { parent: ctx.semantic_function_id, key: func_key }
             .intern(ctx.db);
@@ -1822,7 +1858,7 @@ fn add_closure_call_function(
     .intern(semantic_db);
     let function_with_body_id = FunctionWithBodyLongId::Generated {
         parent: encapsulated_ctx.semantic_function_id,
-        key: GeneratedFunctionKey::TraitFunc(function, closure_ty.wrapper_location),
+        key: GeneratedFunctionKey::TraitFunc(trait_function, closure_ty.wrapper_location),
     }
     .intern(encapsulated_ctx.db);
     let signature = Signature::from_semantic(
@@ -1835,9 +1871,8 @@ fn add_closure_call_function(
     let root_block_id = alloc_empty_block(&mut ctx);
     let mut builder = BlockBuilder::root(&mut ctx, root_block_id);
 
-    let (closure_param_var_id, closure_var) = if trait_id
-        == semantic::corelib::fn_once_trait(semantic_db)
-    {
+    let info = ctx.db.core_info();
+    let (closure_param_var_id, closure_var) = if trait_id == info.fn_once_trt {
         // If the closure is FnOnce, the closure is passed by value.
         let closure_param_var = ctx.new_var(VarRequest { ty: expr.ty, location: expr_location });
         let closure_var = VarUsage { var_id: closure_param_var, location: expr_location };
@@ -1887,6 +1922,8 @@ fn add_closure_call_function(
     .add(&mut ctx, &mut builder.statements);
     for (param_var, param) in param_vars.into_iter().zip(expr.params.iter()) {
         builder.semantics.introduce((&parameter_as_member_path(param.clone())).into(), param_var);
+        ctx.semantic_defs
+            .insert(semantic::VarId::Param(param.id), semantic::Binding::Param(param.clone()));
     }
     let lowered_expr = lower_expr(&mut ctx, &mut builder, expr.body);
     let maybe_sealed_block = lowered_expr_to_block_scope_end(&mut ctx, builder, lowered_expr);
@@ -1905,9 +1942,10 @@ fn add_closure_call_function(
         signature: ctx.signature.clone(),
         parameters,
     };
-    encapsulated_ctx
-        .lowerings
-        .insert(GeneratedFunctionKey::TraitFunc(function, closure_ty.wrapper_location), lowered);
+    encapsulated_ctx.lowerings.insert(
+        GeneratedFunctionKey::TraitFunc(trait_function, closure_ty.wrapper_location),
+        lowered,
+    );
     Ok(())
 }
 
@@ -1935,9 +1973,9 @@ fn lower_expr_closure(
         expr,
         builder.semantics.closures.get(&capture_var_usage.var_id).unwrap(),
         if ctx.variables[capture_var_usage.var_id].copyable.is_ok() {
-            semantic::corelib::fn_trait(ctx.db.upcast())
+            ctx.db.core_info().fn_trt
         } else {
-            semantic::corelib::fn_once_trait(ctx.db.upcast())
+            ctx.db.core_info().fn_once_trt
         },
     )
     .map_err(LoweringFlowError::Failed)?;
@@ -1972,13 +2010,13 @@ fn lower_expr_error_propagate(
 
     let match_input = lowered_expr.as_var_usage(ctx, builder)?;
     // Ok arm.
-    let subscope_ok = create_subscope_with_bound_refs(ctx, builder);
+    let subscope_ok = create_subscope(ctx, builder);
     let block_ok_id = subscope_ok.block_id;
     let expr_var = ctx.new_var(VarRequest { ty: ok_variant.ty, location });
     let sealed_block_ok = subscope_ok.goto_callsite(Some(VarUsage { var_id: expr_var, location }));
 
     // Err arm.
-    let mut subscope_err = create_subscope_with_bound_refs(ctx, builder);
+    let mut subscope_err = create_subscope(ctx, builder);
     let block_err_id = subscope_err.block_id;
     let err_value = ctx.new_var(VarRequest { ty: err_variant.ty, location });
     let err_res = generators::EnumConstruct {
@@ -2129,14 +2167,6 @@ fn alloc_empty_block(ctx: &mut LoweringContext<'_, '_>) -> BlockId {
 }
 
 /// Creates a new subscope of the given builder, with an empty block.
-fn create_subscope_with_bound_refs(
-    ctx: &mut LoweringContext<'_, '_>,
-    builder: &BlockBuilder,
-) -> BlockBuilder {
-    builder.child_block_builder(alloc_empty_block(ctx))
-}
-
-/// Creates a new subscope of the given builder, with unchanged refs and with an empty block.
 fn create_subscope(ctx: &mut LoweringContext<'_, '_>, builder: &BlockBuilder) -> BlockBuilder {
     builder.child_block_builder(alloc_empty_block(ctx))
 }

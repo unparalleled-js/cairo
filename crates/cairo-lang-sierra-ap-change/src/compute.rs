@@ -62,7 +62,7 @@ struct ApChangeCalcHelper<'a, TokenUsages: Fn(StatementIdx, CostTokenType) -> us
     token_usages: TokenUsages,
     /// The size of allocated locals until the statement.
     locals_size: UnorderedHashMap<StatementIdx, usize>,
-    /// The lower bound of a ap-change to the furthest return per statement.
+    /// The lower bound of an ap-change to the furthest return per statement.
     known_ap_change_to_return: UnorderedHashMap<StatementIdx, usize>,
     /// The ap_change of functions with known ap changes.
     function_ap_change: OrderedHashMap<FunctionId, usize>,
@@ -139,7 +139,7 @@ impl<'a, TokenUsages: Fn(StatementIdx, CostTokenType) -> usize>
         Ok(())
     }
 
-    /// Calculates the lower bound of a ap-change to the furthest return per statement.
+    /// Calculates the lower bound of an ap-change to the furthest return per statement.
     /// If it is unknown does not set it.
     fn calc_known_ap_change_for_statement(
         &mut self,
@@ -223,10 +223,10 @@ impl<'a, TokenUsages: Fn(StatementIdx, CostTokenType) -> usize>
     fn calc_tracking_info_for_statement(&mut self, idx: StatementIdx) -> Result<(), ApChangeError> {
         for (ap_change, target) in self.get_branches(idx)? {
             if matches!(ap_change, ApChange::EnableApTracking) {
-                self.tracking_info.insert(target, ApTrackingInfo {
-                    base: ApTrackingBase::EnableStatement(idx),
-                    ap_change: 0,
-                });
+                self.tracking_info.insert(
+                    target,
+                    ApTrackingInfo { base: ApTrackingBase::EnableStatement(idx), ap_change: 0 },
+                );
                 continue;
             }
             let Some(mut base_info) = self.tracking_info.get(&idx).cloned() else {
@@ -365,10 +365,10 @@ pub fn calc_ap_changes<TokenUsages: Fn(StatementIdx, CostTokenType) -> usize>(
         helper.tracked_ap_change_reverse_topological_order()?;
     // Setting tracking info for function entry points.
     for f in &program.funcs {
-        helper.tracking_info.insert(f.entry_point, ApTrackingInfo {
-            base: ApTrackingBase::FunctionStart(f.id.clone()),
-            ap_change: 0,
-        });
+        helper.tracking_info.insert(
+            f.entry_point,
+            ApTrackingInfo { base: ApTrackingBase::FunctionStart(f.id.clone()), ap_change: 0 },
+        );
     }
     for idx in ap_tracked_reverse_topological_ordering.iter().rev() {
         helper.calc_tracking_info_for_statement(*idx)?;

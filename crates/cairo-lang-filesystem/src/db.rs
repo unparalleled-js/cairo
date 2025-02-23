@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::{LookupIntern, Upcast};
+use salsa::Durability;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, ToSmolStr};
@@ -12,8 +13,8 @@ use smol_str::{SmolStr, ToSmolStr};
 use crate::cfg::CfgSet;
 use crate::flag::Flag;
 use crate::ids::{
-    CodeMapping, CrateId, CrateLongId, Directory, FileId, FileLongId, FlagId, FlagLongId,
-    VirtualFile,
+    BlobId, BlobLongId, CodeMapping, CodeOrigin, CrateId, CrateLongId, Directory, FileId,
+    FileLongId, FlagId, FlagLongId, VirtualFile,
 };
 use crate::span::{FileSummary, TextOffset, TextSpan, TextWidth};
 
@@ -26,7 +27,7 @@ pub const CORELIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Unique identifier of a crate.
 ///
-/// This directly translates to [`DependencySettings.discriminator`] expect the discriminator
+/// This directly translates to [`DependencySettings.discriminator`] except the discriminator
 /// **must** be `None` for the core crate.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct CrateIdentifier(SmolStr);
@@ -49,11 +50,12 @@ pub struct CrateConfiguration {
     /// The root directory of the crate.
     pub root: Directory,
     pub settings: CrateSettings,
+    pub cache_file: Option<BlobId>,
 }
 impl CrateConfiguration {
     /// Returns a new configuration.
     pub fn default_for_root(root: Directory) -> Self {
-        Self { root, settings: CrateSettings::default() }
+        Self { root, settings: CrateSettings::default(), cache_file: None }
     }
 }
 
@@ -150,9 +152,11 @@ pub struct DependencySettings {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExperimentalFeaturesConfig {
     pub negative_impls: bool,
+    /// Allows using associated item constraints.
+    pub associated_item_constraints: bool,
     /// Allows using coupon types and coupon calls.
     ///
-    /// Each function has a associated `Coupon` type, which represents paying the cost of the
+    /// Each function has an associated `Coupon` type, which represents paying the cost of the
     /// function before calling it.
     #[serde(default)]
     pub coupons: bool,
@@ -178,6 +182,8 @@ pub trait FilesGroup: ExternalFiles {
     fn intern_crate(&self, crt: CrateLongId) -> CrateId;
     #[salsa::interned]
     fn intern_file(&self, file: FileLongId) -> FileId;
+    #[salsa::interned]
+    fn intern_blob(&self, blob: BlobLongId) -> BlobId;
     #[salsa::interned]
     fn intern_flag(&self, flag: FlagLongId) -> FlagId;
 
@@ -212,6 +218,8 @@ pub trait FilesGroup: ExternalFiles {
     fn file_content(&self, file_id: FileId) -> Option<Arc<str>>;
     fn file_summary(&self, file_id: FileId) -> Option<Arc<FileSummary>>;
 
+    /// Query for the blob content.
+    fn blob_content(&self, blob_id: BlobId) -> Option<Arc<[u8]>>;
     /// Query to get a compilation flag by its ID.
     fn get_flag(&self, id: FlagId) -> Option<Arc<Flag>>;
 }
@@ -237,9 +245,11 @@ pub fn init_dev_corelib(db: &mut (dyn FilesGroup + 'static), core_lib_dir: PathB
                 dependencies: Default::default(),
                 experimental_features: ExperimentalFeaturesConfig {
                     negative_impls: true,
+                    associated_item_constraints: true,
                     coupons: true,
                 },
             },
+            cache_file: None,
         }),
     );
 }
@@ -298,22 +308,32 @@ fn crates(db: &dyn FilesGroup) -> Vec<CrateId> {
 fn crate_config(db: &dyn FilesGroup, crt: CrateId) -> Option<CrateConfiguration> {
     match crt.lookup_intern(db) {
         CrateLongId::Real { .. } => db.crate_configs().get(&crt).cloned(),
-        CrateLongId::Virtual { name: _, file_id, settings } => Some(CrateConfiguration {
-            root: Directory::Virtual {
-                files: BTreeMap::from([("lib.cairo".into(), file_id)]),
-                dirs: Default::default(),
-            },
-            settings: toml::from_str(&settings).expect("Failed to parse virtual crate settings."),
-        }),
+        CrateLongId::Virtual { name: _, file_id, settings, cache_file } => {
+            Some(CrateConfiguration {
+                root: Directory::Virtual {
+                    files: BTreeMap::from([("lib.cairo".into(), file_id)]),
+                    dirs: Default::default(),
+                },
+                settings: toml::from_str(&settings)
+                    .expect("Failed to parse virtual crate settings."),
+                cache_file,
+            })
+        }
     }
 }
 
 fn priv_raw_file_content(db: &dyn FilesGroup, file: FileId) -> Option<Arc<str>> {
     match file.lookup_intern(db) {
-        FileLongId::OnDisk(path) => match fs::read_to_string(path) {
-            Ok(content) => Some(content.into()),
-            Err(_) => None,
-        },
+        FileLongId::OnDisk(path) => {
+            // This does not result in performance cost due to OS caching and the fact that salsa
+            // will re-execute only this single query if the file content did not change.
+            db.salsa_runtime().report_synthetic_read(Durability::LOW);
+
+            match fs::read_to_string(path) {
+                Ok(content) => Some(content.into()),
+                Err(_) => None,
+            }
+        }
         FileLongId::Virtual(virt) => Some(virt.content),
         FileLongId::External(external_id) => Some(db.ext_as_virtual(external_id).content),
     }
@@ -324,8 +344,8 @@ fn file_content(db: &dyn FilesGroup, file: FileId) -> Option<Arc<str>> {
 }
 fn file_summary(db: &dyn FilesGroup, file: FileId) -> Option<Arc<FileSummary>> {
     let content = db.file_content(file)?;
-    let mut line_offsets = vec![TextOffset::default()];
-    let mut offset = TextOffset::default();
+    let mut line_offsets = vec![TextOffset::START];
+    let mut offset = TextOffset::START;
     for ch in content.chars() {
         offset = offset.add_width(TextWidth::from_char(ch));
         if ch == '\n' {
@@ -336,6 +356,22 @@ fn file_summary(db: &dyn FilesGroup, file: FileId) -> Option<Arc<FileSummary>> {
 }
 fn get_flag(db: &dyn FilesGroup, id: FlagId) -> Option<Arc<Flag>> {
     db.flags().get(&id).cloned()
+}
+
+fn blob_content(db: &dyn FilesGroup, blob: BlobId) -> Option<Arc<[u8]>> {
+    match blob.lookup_intern(db) {
+        BlobLongId::OnDisk(path) => {
+            // This does not result in performance cost due to OS caching and the fact that salsa
+            // will re-execute only this single query if the file content did not change.
+            db.salsa_runtime().report_synthetic_read(Durability::LOW);
+
+            match fs::read(path) {
+                Ok(content) => Some(content.into()),
+                Err(_) => None,
+            }
+        }
+        BlobLongId::Virtual(content) => Some(content),
+    }
 }
 
 /// Returns the location of the originating user code.
@@ -349,7 +385,7 @@ pub fn get_originating_location(
         parent_files.push(file_id);
     }
     while let Some((parent, code_mappings)) = get_parent_and_mapping(db, file_id) {
-        if let Some(origin) = code_mappings.iter().find_map(|mapping| mapping.translate(span)) {
+        if let Some(origin) = translate_location(&code_mappings, span) {
             span = origin;
             file_id = parent;
             if let Some(ref mut parent_files) = parent_files {
@@ -360,6 +396,95 @@ pub fn get_originating_location(
         }
     }
     (file_id, span)
+}
+
+/// This function finds a span in original code that corresponds to the provided span in the
+/// generated code, using the provided code mappings.
+///
+/// Code mappings describe a mapping between the original code and the generated one.
+/// Each mapping has a resulting span in a generated file and an origin in the original file.
+///
+/// If any of the provided mappings fully contains the span, origin span of the mapping will be
+/// returned. Otherwise, the function will try to find a span that is a result of a concatenation of
+/// multiple consecutive mappings.
+fn translate_location(code_mapping: &[CodeMapping], span: TextSpan) -> Option<TextSpan> {
+    // Find all mappings that have non-empty intersection with the provided span.
+    let intersecting_mappings = || {
+        code_mapping.iter().filter(|mapping| {
+            // Omit mappings to the left or to the right of current span.
+            !(mapping.span.end < span.start || mapping.span.start > span.end)
+        })
+    };
+
+    // If any of the mappings fully contains the span, return the origin span of the mapping.
+    if let Some(containing) = intersecting_mappings().find(|mapping| {
+        mapping.span.contains(span) && !matches!(mapping.origin, CodeOrigin::CallSite(_))
+    }) {
+        // Found a span that fully contains the current one - translates it.
+        return containing.translate(span);
+    }
+
+    // Call site can be treated as default origin.
+    let call_site = intersecting_mappings()
+        .find(|mapping| {
+            mapping.span.contains(span) && matches!(mapping.origin, CodeOrigin::CallSite(_))
+        })
+        .and_then(|containing| containing.translate(span));
+
+    let mut matched = intersecting_mappings()
+        .filter(|mapping| matches!(mapping.origin, CodeOrigin::Span(_)))
+        .collect::<Vec<_>>();
+
+    // If no mappings intersect with the span, translation is impossible.
+    if matched.is_empty() {
+        return None;
+    }
+
+    // Take the first mapping to the left.
+    matched.sort_by_key(|mapping| mapping.span);
+    let (first, matched) = matched.split_first().expect("non-empty vec always has first element");
+
+    // Find the last mapping which consecutively follows the first one.
+    // Note that all spans here intersect with the given one.
+    let mut last = first;
+    for mapping in matched {
+        if mapping.span.start > last.span.end {
+            break;
+        }
+
+        let mapping_origin =
+            mapping.origin.as_span().expect("mappings with start origin should be filtered out");
+        let last_origin =
+            last.origin.as_span().expect("mappings with start origin should be filtered out");
+        // Make sure, the origins are consecutive.
+        if mapping_origin.start < last_origin.end {
+            break;
+        }
+
+        last = mapping;
+    }
+
+    // We construct new span from the first and last mappings.
+    // If the new span does not contain the original span, there is no translation.
+    let constructed_span = TextSpan { start: first.span.start, end: last.span.end };
+    if !constructed_span.contains(span) {
+        return call_site;
+    }
+
+    // We use the boundaries of the first and last mappings to calculate new span origin.
+    let start = match first.origin {
+        CodeOrigin::Start(origin_start) => origin_start.add_width(span.start - first.span.start),
+        CodeOrigin::Span(span) => span.start,
+        CodeOrigin::CallSite(span) => span.start,
+    };
+
+    let end = match last.origin {
+        CodeOrigin::Start(_) => start.add_width(span.width()),
+        CodeOrigin::Span(span) => span.end,
+        CodeOrigin::CallSite(span) => span.start,
+    };
+
+    Some(TextSpan { start, end })
 }
 
 /// Returns the parent file and the code mappings of the file.

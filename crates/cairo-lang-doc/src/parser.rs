@@ -14,11 +14,11 @@ use cairo_lang_semantic::items::functions::GenericFunctionId;
 use cairo_lang_semantic::resolve::{AsSegments, ResolvedGenericItem, Resolver};
 use cairo_lang_syntax::node::ast::{Expr, ExprPath, ItemModule};
 use cairo_lang_syntax::node::helpers::GetIdentifier;
-use cairo_lang_syntax::node::kind::SyntaxKind;
 use cairo_lang_syntax::node::{SyntaxNode, TypedSyntaxNode};
 use cairo_lang_utils::Intern;
 use pulldown_cmark::{
-    BrokenLink, CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
+    BrokenLink, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser as MarkdownParser,
+    Tag, TagEnd,
 };
 
 use crate::db::DocGroup;
@@ -124,7 +124,7 @@ impl<'a> DocumentationCommentParser<'a> {
                         }
                     }
                 }
-                Event::End(TagEnd::Link { .. }) => {
+                Event::End(TagEnd::Link) => {
                     if let Some(link) = current_link.take() {
                         tokens.push(DocumentationCommentToken::Link(link));
                     }
@@ -140,6 +140,12 @@ impl<'a> DocumentationCommentParser<'a> {
                 }
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => {
                     is_indented_code_block = true;
+                }
+                Event::Start(Tag::Heading { level, .. }) => {
+                    tokens.push(DocumentationCommentToken::Content(format!(
+                        "  {} ",
+                        heading_level_to_markdown(level)
+                    )));
                 }
                 _ => {}
             }
@@ -159,7 +165,7 @@ impl<'a> DocumentationCommentParser<'a> {
         let mut resolver =
             Resolver::new(self.db.upcast(), containing_module, InferenceId::NoContext);
         let mut diagnostics = SemanticDiagnostics::default();
-        let segments = self.prase_comment_link_path(path)?;
+        let segments = self.parse_comment_link_path(path)?;
         resolver
             .resolve_generic_path(
                 &mut diagnostics,
@@ -171,8 +177,8 @@ impl<'a> DocumentationCommentParser<'a> {
             .to_documentable_item_id(self.db.upcast())
     }
 
-    /// Parses the path as a string to an Path Expression, which can be later used by a resolver.
-    fn prase_comment_link_path(&self, path: String) -> Option<ExprPath> {
+    /// Parses the path as a string to a Path Expression, which can be later used by a resolver.
+    fn parse_comment_link_path(&self, path: String) -> Option<ExprPath> {
         let virtual_file = FileLongId::Virtual(VirtualFile {
             parent: Default::default(),
             name: Default::default(),
@@ -230,9 +236,9 @@ impl<'a> DocumentationCommentParser<'a> {
         // Get the stack (bottom-up) of submodule names in the file containing the node, in the main
         // module, that lead to the node.
         iter::successors(node.parent(), SyntaxNode::parent)
-            .filter(|node| node.kind(syntax_db) == SyntaxKind::ItemModule)
-            .map(|node| {
-                ItemModule::from_syntax_node(syntax_db, node)
+            .filter_map(|node| ItemModule::cast(syntax_db, node))
+            .map(|item_module| {
+                item_module
                     .stable_ptr()
                     .name_green(syntax_db)
                     .identifier(syntax_db)
@@ -307,9 +313,6 @@ impl ToDocumentableItemId<DocumentableItemId> for ResolvedGenericItem {
                 Some(DocumentableItemId::Crate(id))
             }
             ResolvedGenericItem::Variant(variant) => Some(DocumentableItemId::Variant(variant.id)),
-            ResolvedGenericItem::TraitFunction(id) => Some(DocumentableItemId::LookupItem(
-                LookupItemId::TraitItem(TraitItemId::Function(id)),
-            )),
             ResolvedGenericItem::GenericFunction(GenericFunctionId::Impl(generic_impl_func)) => {
                 if let Some(impl_function) = generic_impl_func.impl_function(db).ok().flatten() {
                     Some(DocumentableItemId::LookupItem(LookupItemId::ImplItem(
@@ -320,11 +323,6 @@ impl ToDocumentableItemId<DocumentableItemId> for ResolvedGenericItem {
                         TraitItemId::Function(generic_impl_func.function),
                     )))
                 }
-            }
-            ResolvedGenericItem::GenericFunction(GenericFunctionId::Trait(trait_func)) => {
-                Some(DocumentableItemId::LookupItem(LookupItemId::TraitItem(
-                    TraitItemId::Function(trait_func.trait_function(db)),
-                )))
             }
             ResolvedGenericItem::Variable(_) => None,
         }
@@ -360,5 +358,18 @@ impl DebugWithDb<dyn DocGroup> for CommentLinkToken {
             .field("path", &self.path)
             .field("resolved_item_name", &self.resolved_item.map(|item| item.name(db.upcast())))
             .finish()
+    }
+}
+
+/// Maps `HeadingLevel` to correct markdown marker.
+fn heading_level_to_markdown(heading_level: HeadingLevel) -> String {
+    let heading_char: String = String::from("#");
+    match heading_level {
+        HeadingLevel::H1 => heading_char,
+        HeadingLevel::H2 => heading_char.repeat(2),
+        HeadingLevel::H3 => heading_char.repeat(3),
+        HeadingLevel::H4 => heading_char.repeat(4),
+        HeadingLevel::H5 => heading_char.repeat(5),
+        HeadingLevel::H6 => heading_char.repeat(6),
     }
 }
